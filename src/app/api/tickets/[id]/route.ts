@@ -1,31 +1,39 @@
-import { readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { NextResponse } from "next/server";
+import { pool } from "@/lib/db";
+import type { PoolClient } from "pg";
+
+
 
 type TicketStatus = "Open" | "Processing" | "Closed";
+
 type TicketPriority = "Low" | "Medium" | "High" | "Emergency";
 
-type TicketReply = {
+type TicketRow = {
   id: number;
-  sender: string;
-  role: "Staff" | "Customer";
-  message: string;
-  createdAt: string;
-};
-
-type Ticket = {
-  id: number;
-  date: string;
+  customer_name: string;
+  email: string;
+  phone: string | null;
   subject: string;
   department: string;
   priority: TicketPriority;
-  email: string;
   status: TicketStatus;
-  customerName: string;
-  phone?: string;
-  orderNumber?: string;
+  order_number: string | null;
   message: string;
-  replies?: unknown[];
+  created_at: Date | string;
+  updated_at: Date | string;
+  attachment_name?: string | null;
+  attachment_url?: string | null;
+  attachment_size?: number | null;
+  attachment_type?: string | null;
+};
+
+type ReplyRow = {
+  id: number;
+  ticket_id: number;
+  sender: string;
+  role: "Staff" | "Customer";
+  message: string;
+  created_at: Date | string;
 };
 
 type UpdateTicketBody = {
@@ -36,17 +44,47 @@ type UpdateTicketBody = {
 
 const TICKET_STATUSES: TicketStatus[] = ["Open", "Processing", "Closed"];
 
-const DATA_FILE = path.join(process.cwd(), "data", "tickets.json");
+function getDateString(value: Date | string): string {
+  return value instanceof Date
+    ? value.toISOString()
+    : new Date(value).toISOString();
+}
 
-async function readTickets(): Promise<Ticket[]> {
-  const content = await readFile(DATA_FILE, "utf8");
-  const data: unknown = JSON.parse(content);
+function formatReply(reply: ReplyRow) {
+  return {
+    id: reply.id,
+    sender: reply.sender,
+    role: reply.role,
+    message: reply.message,
+    createdAt: getDateString(reply.created_at),
+  };
+}
 
-  if (!Array.isArray(data)) {
-    throw new Error("The tickets data file must contain a JSON array.");
-  }
-
-  return data as Ticket[];
+function formatTicket(ticket: TicketRow, replies: ReplyRow[] = []) {
+  return {
+    id: ticket.id,
+    customerName: ticket.customer_name,
+    email: ticket.email,
+    phone: ticket.phone ?? "",
+    subject: ticket.subject,
+    department: ticket.department,
+    priority: ticket.priority,
+    status: ticket.status,
+    orderNumber: ticket.order_number ?? "",
+    message: ticket.message,
+    date: getDateString(ticket.created_at),
+    replies: replies.map(formatReply),
+    ...(ticket.attachment_name
+      ? {
+          attachment: {
+            name: ticket.attachment_name,
+            url: ticket.attachment_url ?? "",
+            size: ticket.attachment_size ?? 0,
+            type: ticket.attachment_type ?? "",
+          },
+        }
+      : {}),
+  };
 }
 
 async function getTicketId(
@@ -58,7 +96,7 @@ async function getTicketId(
   return Number.isSafeInteger(ticketId) && ticketId > 0 ? ticketId : null;
 }
 
-// GET: Get a ticket by ID
+// GET /api/tickets/[id]
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
@@ -76,11 +114,17 @@ export async function GET(
       );
     }
 
-    const tickets = await readTickets();
+    const ticketResult = await pool.query<TicketRow>(
+      `
+        SELECT *
+        FROM tickets
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [ticketId],
+    );
 
-    const ticket = tickets.find((item) => Number(item.id) === ticketId);
-
-    if (!ticket) {
+    if (ticketResult.rows.length === 0) {
       return NextResponse.json(
         {
           success: false,
@@ -89,6 +133,18 @@ export async function GET(
         { status: 404 },
       );
     }
+
+    const repliesResult = await pool.query<ReplyRow>(
+      `
+        SELECT *
+        FROM ticket_replies
+        WHERE ticket_id = $1
+        ORDER BY created_at ASC, id ASC
+      `,
+      [ticketId],
+    );
+
+    const ticket = formatTicket(ticketResult.rows[0], repliesResult.rows);
 
     return NextResponse.json(
       {
@@ -114,11 +170,13 @@ export async function GET(
   }
 }
 
-// PATCH: Update ticket status or add a reply
+// PATCH /api/tickets/[id]
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  let client: PoolClient | undefined;
+
   try {
     const ticketId = await getTicketId(params);
 
@@ -169,6 +227,19 @@ export async function PATCH(
       );
     }
 
+    if (
+      body.closeAfterReply !== undefined &&
+      typeof body.closeAfterReply !== "boolean"
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "closeAfterReply must be a boolean.",
+        },
+        { status: 400 },
+      );
+    }
+
     let replyText = "";
 
     if (hasReply) {
@@ -205,13 +276,22 @@ export async function PATCH(
       }
     }
 
-    const tickets = await readTickets();
+    client = await pool.connect();
+    await client.query("BEGIN");
 
-    const ticketIndex = tickets.findIndex(
-      (item) => Number(item.id) === ticketId,
+    const ticketResult = await client.query<TicketRow>(
+      `
+        SELECT *
+        FROM tickets
+        WHERE id = $1
+        FOR UPDATE
+      `,
+      [ticketId],
     );
 
-    if (ticketIndex === -1) {
+    if (ticketResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
       return NextResponse.json(
         {
           success: false,
@@ -221,55 +301,81 @@ export async function PATCH(
       );
     }
 
-    const existingTicket = tickets[ticketIndex];
+    const existingTicket = ticketResult.rows[0];
 
-    const currentReplies: unknown[] = Array.isArray(existingTicket.replies)
-      ? existingTicket.replies
-      : [];
+    if (hasReply && existingTicket.status === "Closed" && !hasStatus) {
+      await client.query("ROLLBACK");
 
-    const updatedTicket: Ticket = {
-      ...existingTicket,
-    };
+      return NextResponse.json(
+        {
+          success: false,
+          message: "This ticket is closed. Reopen it before replying.",
+        },
+        { status: 409 },
+      );
+    }
 
-    if (hasStatus) {
-      updatedTicket.status = body.status as TicketStatus;
+    let updatedStatus: TicketStatus = hasStatus
+      ? (body.status as TicketStatus)
+      : existingTicket.status;
+
+    if (hasReply && body.closeAfterReply === true) {
+      updatedStatus = "Closed";
+    }
+
+    if (updatedStatus !== existingTicket.status) {
+      await client.query(
+        `
+          UPDATE tickets
+          SET status = $1,
+              updated_at = NOW()
+          WHERE id = $2
+        `,
+        [updatedStatus, ticketId],
+      );
     }
 
     if (hasReply) {
-      if (existingTicket.status === "Closed" && !hasStatus) {
-        return NextResponse.json(
-          {
-            success: false,
-            message: "This ticket is closed. Reopen it before replying.",
-          },
-          { status: 409 },
-        );
-      }
-
-      const newReply: TicketReply = {
-        id: Date.now(),
-        sender: "Support Staff",
-        role: "Staff",
-        message: replyText,
-        createdAt: new Date().toISOString(),
-      };
-
-      updatedTicket.replies = [...currentReplies, newReply];
-
-      if (body.closeAfterReply === true) {
-        updatedTicket.status = "Closed";
-      }
+      await client.query(
+        `
+          INSERT INTO ticket_replies (
+            ticket_id,
+            sender,
+            role,
+            message
+          )
+          VALUES ($1, $2, $3, $4)
+        `,
+        [ticketId, "Support Staff", "Staff", replyText],
+      );
     }
 
-    tickets[ticketIndex] = updatedTicket;
+    const updatedTicketResult = await client.query<TicketRow>(
+      `
+        SELECT *
+        FROM tickets
+        WHERE id = $1
+      `,
+      [ticketId],
+    );
 
-    await writeFile(DATA_FILE, `${JSON.stringify(tickets, null, 2)}\n`, "utf8");
+    const repliesResult = await client.query<ReplyRow>(
+      `
+        SELECT *
+        FROM ticket_replies
+        WHERE ticket_id = $1
+        ORDER BY created_at ASC, id ASC
+      `,
+      [ticketId],
+    );
+
+    await client.query("COMMIT");
 
     return NextResponse.json(
       {
         success: true,
         message: "Ticket updated successfully.",
-        data: updatedTicket,
+        data: formatTicket(updatedTicketResult.rows[0], repliesResult.rows),
       },
       {
         headers: {
@@ -278,6 +384,10 @@ export async function PATCH(
       },
     );
   } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
     console.error("Update ticket error:", error);
 
     return NextResponse.json(
@@ -287,5 +397,7 @@ export async function PATCH(
       },
       { status: 500 },
     );
+  } finally {
+    client?.release();
   }
 }

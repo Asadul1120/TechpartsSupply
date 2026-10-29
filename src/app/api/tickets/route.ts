@@ -1,85 +1,145 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { pool } from "@/lib/db";
+import type { PoolClient } from "pg";
 
-
-const filePath = path.join(process.cwd(), "data", "tickets.json");
+// export const runtime = "nodejs";
 
 type TicketPriority = "Low" | "Medium" | "High" | "Emergency";
 
 type TicketStatus = "Open" | "Processing" | "Closed";
 
-interface Ticket {
+interface TicketRow {
   id: number;
-  customerName: string;
+  customer_name: string;
   email: string;
-  phone: string;
+  phone: string | null;
   subject: string;
   department: string;
   priority: TicketPriority;
   status: TicketStatus;
-  orderNumber: string;
+  order_number: string | null;
   message: string;
-  replies: {
+  created_at: Date | string;
+  replies?: {
     id: number;
     message: string;
     createdAt: string;
   }[];
-  date: string;
 }
 
-// Read tickets from JSON file
-async function readTickets(): Promise<Ticket[]> {
-  const fileContent = await readFile(filePath, "utf-8");
-
-  return JSON.parse(fileContent) as Ticket[];
-}
-
-// Write tickets to JSON file
-async function writeTickets(tickets: Ticket[]): Promise<void> {
-  await writeFile(filePath, JSON.stringify(tickets, null, 2), "utf-8");
+function formatTicket(ticket: TicketRow) {
+  return {
+    id: ticket.id,
+    customerName: ticket.customer_name,
+    email: ticket.email,
+    phone: ticket.phone ?? "",
+    subject: ticket.subject,
+    department: ticket.department,
+    priority: ticket.priority,
+    status: ticket.status,
+    orderNumber: ticket.order_number ?? "",
+    message: ticket.message,
+    replies: ticket.replies ?? [],
+    date:
+      ticket.created_at instanceof Date
+        ? ticket.created_at.toISOString()
+        : new Date(ticket.created_at).toISOString(),
+  };
 }
 
 // GET /api/tickets
 export async function GET(request: NextRequest) {
   try {
-    const tickets = await readTickets();
-
     const { searchParams } = request.nextUrl;
 
-    const search = searchParams.get("search")?.toLowerCase();
-    const status = searchParams.get("status");
-    const priority = searchParams.get("priority");
+    const search = searchParams.get("search")?.trim() ?? "";
+    const status = searchParams.get("status") ?? "All";
+    const priority = searchParams.get("priority") ?? "All";
 
-    let filteredTickets = [...tickets];
+    const conditions: string[] = [];
+    const values: string[] = [];
 
-    // Search by subject, customer name, or email
     if (search) {
-      filteredTickets = filteredTickets.filter((ticket) =>
-        [ticket.subject, ticket.customerName, ticket.email].some((value) =>
-          value.toLowerCase().includes(search),
-        ),
-      );
+      values.push(`%${search}%`);
+
+      conditions.push(`
+        (
+          subject ILIKE $${values.length}
+          OR customer_name ILIKE $${values.length}
+          OR email ILIKE $${values.length}
+        )
+      `);
     }
 
-    // Filter by status
-    if (status && status !== "All") {
-      filteredTickets = filteredTickets.filter(
-        (ticket) => ticket.status === status,
-      );
+    if (status !== "All") {
+      const allowedStatuses: TicketStatus[] = ["Open", "Processing", "Closed"];
+
+      if (!allowedStatuses.includes(status as TicketStatus)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Invalid status value.",
+          },
+          { status: 400 },
+        );
+      }
+
+      values.push(status);
+      conditions.push(`status = $${values.length}`);
     }
 
-    // Filter by priority
-    if (priority && priority !== "All") {
-      filteredTickets = filteredTickets.filter(
-        (ticket) => ticket.priority === priority,
-      );
+    if (priority !== "All") {
+      const allowedPriorities: TicketPriority[] = [
+        "Low",
+        "Medium",
+        "High",
+        "Emergency",
+      ];
+
+      if (!allowedPriorities.includes(priority as TicketPriority)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Invalid priority value.",
+          },
+          { status: 400 },
+        );
+      }
+
+      values.push(priority);
+      conditions.push(`priority = $${values.length}`);
     }
+
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const result = await pool.query<TicketRow>(
+      `
+        SELECT
+          id,
+          customer_name,
+          email,
+          phone,
+          subject,
+          department,
+          priority,
+          status,
+          order_number,
+          message,
+          created_at
+        FROM tickets
+        ${whereClause}
+        ORDER BY created_at DESC, id DESC
+      `,
+      values,
+    );
+
+    const tickets = result.rows.map(formatTicket);
 
     return NextResponse.json({
       success: true,
-      total: filteredTickets.length,
-      data: filteredTickets,
+      total: tickets.length,
+      data: tickets,
     });
   } catch (error) {
     console.error("GET tickets error:", error);
@@ -96,6 +156,8 @@ export async function GET(request: NextRequest) {
 
 // POST /api/tickets
 export async function POST(request: NextRequest) {
+  let client: PoolClient | undefined;
+
   try {
     let body: Record<string, unknown>;
 
@@ -123,7 +185,7 @@ export async function POST(request: NextRequest) {
     } = body;
 
     // Validate required fields
-    const requiredFields = {
+    const requiredFields: Record<string, unknown> = {
       customerName,
       email,
       subject,
@@ -144,11 +206,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Validate email
-    if (
-      typeof email !== "string" ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    ) {
+    const cleanEmail = (email as string).trim().toLowerCase();
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return NextResponse.json(
         {
           success: false,
@@ -158,7 +218,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate priority
     const allowedPriorities: TicketPriority[] = [
       "Low",
       "Medium",
@@ -166,10 +225,7 @@ export async function POST(request: NextRequest) {
       "Emergency",
     ];
 
-    if (
-      typeof priority !== "string" ||
-      !allowedPriorities.includes(priority as TicketPriority)
-    ) {
+    if (!allowedPriorities.includes(priority as TicketPriority)) {
       return NextResponse.json(
         {
           success: false,
@@ -179,31 +235,68 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const tickets = await readTickets();
+    const cleanCustomerName = (customerName as string).trim();
+    const cleanSubject = (subject as string).trim();
+    const cleanDepartment = (department as string).trim();
+    const cleanMessage = (message as string).trim();
 
-    const nextId =
-      tickets.length > 0
-        ? Math.max(...tickets.map((ticket) => ticket.id)) + 1
-        : 1;
+    if (
+      !cleanCustomerName ||
+      !cleanSubject ||
+      !cleanDepartment ||
+      !cleanMessage
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Required fields cannot be empty.",
+        },
+        { status: 400 },
+      );
+    }
 
-    const newTicket: Ticket = {
-      id: nextId,
-      customerName: (customerName as string).trim(),
-      email: (email as string).trim().toLowerCase(),
-      phone: typeof phone === "string" ? phone.trim() : "",
-      subject: (subject as string).trim(),
-      department: (department as string).trim(),
-      priority: priority as TicketPriority,
-      status: "Open",
-      orderNumber: typeof orderNumber === "string" ? orderNumber.trim() : "",
-      message: (message as string).trim(),
-      replies: [],
-      date: new Date().toISOString(),
-    };
+    client = await pool.connect();
 
-    tickets.unshift(newTicket);
+    const result = await client.query<TicketRow>(
+      `
+        INSERT INTO tickets (
+          customer_name,
+          email,
+          phone,
+          subject,
+          department,
+          priority,
+          status,
+          order_number,
+          message
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'Open', $7, $8)
+        RETURNING
+          id,
+          customer_name,
+          email,
+          phone,
+          subject,
+          department,
+          priority,
+          status,
+          order_number,
+          message,
+          created_at
+      `,
+      [
+        cleanCustomerName,
+        cleanEmail,
+        typeof phone === "string" ? phone.trim() || null : null,
+        cleanSubject,
+        cleanDepartment,
+        priority,
+        typeof orderNumber === "string" ? orderNumber.trim() || null : null,
+        cleanMessage,
+      ],
+    );
 
-    await writeTickets(tickets);
+    const newTicket = formatTicket(result.rows[0]);
 
     return NextResponse.json(
       {
@@ -223,5 +316,7 @@ export async function POST(request: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    client?.release();
   }
 }
